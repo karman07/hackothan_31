@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pillow
+pytesseract
+motor
+pymongo
+google-generativeai
+python-dotenv
