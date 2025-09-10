@@ -1,6 +1,9 @@
 import os
 import json
 import re
+import cv2
+import numpy as np
+from skimage.metrics import structural_similarity as ssim
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +13,7 @@ import easyocr
 from bson import json_util
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from rapidfuzz import fuzz
 
 # ----------------- Load environment variables -----------------
 load_dotenv()
@@ -30,9 +34,8 @@ model = genai.GenerativeModel("gemini-1.5-flash")
 reader = easyocr.Reader(["en"])
 
 # ----------------- FastAPI Setup -----------------
-app = FastAPI(title="Certificate OCR API")
+app = FastAPI(title="Certificate OCR + Signature Verification API")
 
-# Enable CORS for all origins (temporary for testing)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -41,36 +44,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ----------------- Cosine Similarity Helper -----------------
-def is_similar_name(name1: str, name2: str, threshold: float = 0.6) -> bool:
-    """
-    Compare two text fields using cosine similarity (TF-IDF).
-    More lenient: default threshold ~0.6.
-    Also allow substring match.
-    """
+# ----------------- Helpers -----------------
+def normalize_text(text: str) -> str:
+    """Lowercase, remove special chars, collapse spaces, fix OCR typos."""
+    text = text.lower()
+    text = re.sub(r"[_\-\[\]{}():;@]", " ", text)  # remove OCR artifacts
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def fix_common_ocr_errors(text: str) -> str:
+    """Fix common OCR misreads."""
+    corrections = {
+        "daughtert": "daughter",
+        "fart-tic": "part-time",
+        "prpfvmatrort": "professional",
+        "dipfoma": "diploma",
+        "dcertificate-conrse": "certificate course",
+        "cechnical": "technical",
+        "nbustrial": "industrial",
+        "mbato": "board"
+    }
+    for wrong, correct in corrections.items():
+        text = text.replace(wrong, correct)
+    return text
+
+def is_strict_name_match(name1: str, name2: str, threshold: float = 0.65) -> bool:
+    """TF-IDF + fuzzy matching with relaxed threshold."""
     if not name1 or not name2:
         return False
-
-    n1, n2 = name1.strip().lower(), name2.strip().lower()
-
-    if n1 in n2 or n2 in n1:
-        return True
-
+    n1, n2 = normalize_text(name1), normalize_text(name2)
     vectorizer = TfidfVectorizer().fit([n1, n2])
     tfidf_matrix = vectorizer.transform([n1, n2])
-    similarity = cosine_similarity(tfidf_matrix[0], tfidf_matrix[1])[0][0]
+    cosine_sim = float(cosine_similarity(tfidf_matrix[0], tfidf_matrix[1])[0][0])
+    fuzzy_sim = fuzz.token_sort_ratio(n1, n2) / 100.0
+    final_score = (cosine_sim * 0.5) + (fuzzy_sim * 0.5)
+    return final_score >= threshold
 
-    return similarity >= threshold
+# ----------------- Image Similarity -----------------
+def load_image_from_bytes(image_bytes: bytes):
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    return cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-# ----------------- Helper Functions -----------------
+def compare_images_orb(img1, img2):
+    orb = cv2.ORB_create()
+    kp1, des1 = orb.detectAndCompute(cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY), None)
+    kp2, des2 = orb.detectAndCompute(cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY), None)
+    if des1 is None or des2 is None:
+        return 0.0
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = bf.match(des1, des2)
+    if not matches:
+        return 0.0
+    good_matches = [m for m in matches if m.distance < 50]
+    return float(len(good_matches) / max(len(matches), 1))
+
+def compare_images_ssim(img1, img2):
+    gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    h, w = min(gray1.shape[0], gray2.shape[0]), min(gray1.shape[1], gray2.shape[1])
+    gray1 = cv2.resize(gray1, (w, h))
+    gray2 = cv2.resize(gray2, (w, h))
+    score, _ = ssim(gray1, gray2, full=True)
+    return float(score)
+
+def compare_signature_watermark(sample_bytes: bytes, cert_bytes: bytes) -> float:
+    img1 = load_image_from_bytes(sample_bytes)
+    img2 = load_image_from_bytes(cert_bytes)
+    orb_score = compare_images_orb(img1, img2)
+    ssim_score = compare_images_ssim(img1, img2)
+    return float((orb_score * 0.6) + (ssim_score * 0.4))
+
+# ----------------- OCR + Parsing -----------------
 def extract_text_from_image(image_bytes: bytes) -> str:
     results = reader.readtext(image_bytes, detail=0)
-    return " ".join(results)
+    text = " ".join(results)
+    text = fix_common_ocr_errors(text)
+    return text
 
 def extract_institute_name(extracted_text: str) -> str:
     lines = extracted_text.splitlines()
     for line in lines:
-        if "institute" in line.lower():
+        if "institute" in line.lower() or "college" in line.lower():
             return line.strip()
     return lines[0].strip() if lines else "Unknown Institute"
 
@@ -97,24 +151,13 @@ def simple_fallback_parser(extracted_text: str) -> dict:
         "exists_in_db": False
     }
 
+# ----------------- Gemini Extractor -----------------
 async def extract_certificate_details_with_gemini(extracted_text: str) -> dict:
     prompt = f"""
     Extract key details from the OCR text of a certificate.
     OCR Text:
     {extracted_text}
-    Return STRICT JSON only. JSON fields required:
-    {{
-      "candidate_name": string or null,
-      "relation": string or null,
-      "parent_name": string or null,
-      "institute": string or null,
-      "course": string or null,
-      "division": string or null,
-      "marks_obtained": string or null,
-      "marks_total": string or null,
-      "date": string or null,
-      "place": string or null
-    }}
+    Return STRICT JSON only.
     """
     try:
         response = model.generate_content(prompt)
@@ -128,32 +171,22 @@ async def extract_certificate_details_with_gemini(extracted_text: str) -> dict:
     except Exception:
         details = simple_fallback_parser(extracted_text)
 
-    # ----------------- MongoDB Matching (course/place focused) -----------------
-    candidate_name = details.get("candidate_name")
-    parent_name = details.get("parent_name")
-    course = details.get("course")
-    place = details.get("place")
+    candidate_name = details.get("candidate_name") or details.get("name") or ""
+    candidate_name = normalize_text(candidate_name)
 
     exists = False
-    if course or place:
+    if candidate_name:
         users = await users_collection.find({}).to_list(length=1000)
         for user in users:
-            # Strong anchors
-            course_match = is_similar_name(course, user.get("course", ""), threshold=0.5)
-            place_match = is_similar_name(place, user.get("place", ""), threshold=0.5)
-
-            # Names are secondary, more lenient
-            cand_match = is_similar_name(candidate_name, user.get("candidate_name", ""), threshold=0.4)
-            parent_match = is_similar_name(parent_name, user.get("parent_name", ""), threshold=0.4)
-
-            # Match logic (prioritize course/place)
-            if (course_match and place_match) or (cand_match and course_match) or (cand_match and place_match):
-                print(f"✅ Matched with user in DB: {user.get('candidate_name')} | {user.get('course')} @ {user.get('place')}")
+            db_name = normalize_text(user.get("candidate_name") or "")
+            if is_strict_name_match(candidate_name, db_name):
                 exists = True
                 break
+
     details["exists_in_db"] = exists
     return details
 
+# ----------------- Authenticity Check -----------------
 async def check_certificate_authenticity(text: str, institute: str, image_bytes: bytes, key_details: dict) -> str:
     candidate_name = key_details.get("candidate_name") or ""
     query = {"candidate_name": {"$regex": candidate_name, "$options": "i"}}
@@ -170,17 +203,27 @@ async def check_certificate_authenticity(text: str, institute: str, image_bytes:
 
 # ----------------- API Endpoint -----------------
 @app.post("/verify-certificate")
-async def verify_certificate(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    extracted_text = extract_text_from_image(image_bytes)
+async def verify_certificate(sample_file: UploadFile = File(...), cert_file: UploadFile = File(...)):
+    sample_bytes = await sample_file.read()
+    cert_bytes = await cert_file.read()
+
+    extracted_text = extract_text_from_image(cert_bytes)
     institute = extract_institute_name(extracted_text)
     key_details = await extract_certificate_details_with_gemini(extracted_text)
-    authenticity = await check_certificate_authenticity(extracted_text, institute, image_bytes, key_details)
+    authenticity = await check_certificate_authenticity(extracted_text, institute, cert_bytes, key_details)
+
+    similarity_score = compare_signature_watermark(sample_bytes, cert_bytes)
+    signature_match = similarity_score > 0.65
+    is_legitimate = key_details.get("exists_in_db", False) and signature_match
+
     return {
         "extracted_text": extracted_text,
         "institute": institute,
         "key_details": key_details,
-        "authenticity_check": authenticity
+        "authenticity_check": authenticity,
+        "signature_similarity_score": float(similarity_score),
+        "signature_match": signature_match,
+        "is_legitimate": is_legitimate
     }
 
 # ----------------- Startup Event -----------------
