@@ -14,6 +14,7 @@ from bson import json_util
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from rapidfuzz import fuzz
+from datetime import datetime
 
 # ----------------- Load environment variables -----------------
 load_dotenv()
@@ -25,6 +26,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[DB_NAME]
 users_collection = db["users"]
+calls_collection = db["calls"]   # ✅ new collection for verification logs
 
 # ----------------- Gemini Setup -----------------
 genai.configure(api_key=GEMINI_API_KEY)
@@ -46,14 +48,12 @@ app.add_middleware(
 
 # ----------------- Helpers -----------------
 def normalize_text(text: str) -> str:
-    """Lowercase, remove special chars, collapse spaces, fix OCR typos."""
     text = text.lower()
-    text = re.sub(r"[_\-\[\]{}():;@]", " ", text)  # remove OCR artifacts
+    text = re.sub(r"[_\-\[\]{}():;@]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 def fix_common_ocr_errors(text: str) -> str:
-    """Fix common OCR misreads."""
     corrections = {
         "daughtert": "daughter",
         "fart-tic": "part-time",
@@ -69,7 +69,6 @@ def fix_common_ocr_errors(text: str) -> str:
     return text
 
 def is_strict_name_match(name1: str, name2: str, threshold: float = 0.65) -> bool:
-    """TF-IDF + fuzzy matching with relaxed threshold."""
     if not name1 or not name2:
         return False
     n1, n2 = normalize_text(name1), normalize_text(name2)
@@ -215,6 +214,20 @@ async def verify_certificate(sample_file: UploadFile = File(...), cert_file: Upl
     similarity_score = compare_signature_watermark(sample_bytes, cert_bytes)
     signature_match = similarity_score > 0.65
     is_legitimate = key_details.get("exists_in_db", False) and signature_match
+
+    # ✅ Save verification call log in "calls" collection
+    log_entry = {
+        "timestamp": datetime.utcnow(),
+        "candidate_name": key_details.get("candidate_name", "Unknown"),
+        "institute": key_details.get("institute", "Unknown"),
+        "course": key_details.get("course", "Unknown"),
+        "signature_similarity_score": float(similarity_score),
+        "signature_match": signature_match,
+        "is_legitimate": is_legitimate,
+        "key_details": key_details,
+        "authenticity_check": authenticity
+    }
+    await calls_collection.insert_one(log_entry)
 
     return {
         "extracted_text": extracted_text,
