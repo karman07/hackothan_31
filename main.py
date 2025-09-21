@@ -3,6 +3,7 @@ import pytesseract
 import requests
 import json
 from fastapi import FastAPI, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pdf2image import convert_from_bytes
 from PIL import Image, UnidentifiedImageError
 from io import BytesIO
@@ -12,6 +13,15 @@ API_KEY = "AIzaSyDDuCc_V3eZavSm91--KyZcjaPToF_MCPU"
 GEMINI_API = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={API_KEY}"
 
 app = FastAPI(title="OCR + Gemini Extractor")
+
+# ✅ Enable CORS (accept all origins)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],        # Accept all origins
+    allow_credentials=True,
+    allow_methods=["*"],        # Allow all HTTP methods
+    allow_headers=["*"],        # Allow all headers
+)
 
 # ------------------- OCR -------------------
 def extract_text(file_bytes: bytes, filename: str) -> str:
